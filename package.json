@@ -1,0 +1,27 @@
+{
+  "name": "aimaster",
+  "version": "1.0.0",
+  "description": "AIMaster (AIM) - Simple AI agent with tool support for local LLMs",
+  "type": "module",
+  "main": "agent.mjs",
+  "scripts": {
+    "start": "node agent.mjs",
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [
+    "ai",
+    "agent",
+    "llm",
+    "tools",
+    "openai"
+  ],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "axios": "^1.6.0",
+    "chalk": "^5.4.1",
+    "commander": "^14.0.0",
+    "inquirer": "^12.6.3",
+    "ora": "^8.2.0"
+  }
+}
