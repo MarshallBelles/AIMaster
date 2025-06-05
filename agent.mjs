@@ -8,8 +8,148 @@ import ora from 'ora';
 import fs from 'fs/promises';
 import fsSync from 'fs';
 import path from 'path';
+import nunjucks from 'nunjucks';
+import { chromium } from 'playwright';
 
 const execAsync = promisify(exec);
+
+// Configure nunjucks environment for template processing
+const templateEnv = nunjucks.configure({ autoescape: false });
+
+/**
+ * Template processing system for tool chaining
+ */
+class TemplateProcessor {
+  /**
+   * Extract template variables from a string or object
+   * @param {any} input - String or object that may contain {{variable}} references  
+   * @returns {Set<string>} Set of variable names found
+   */
+  static extractVariables(input) {
+    const variables = new Set();
+    const templateRegex = /\{\{\s*([^}]+)\s*\}\}/g;
+    
+    const processValue = (value) => {
+      if (typeof value === 'string') {
+        let match;
+        while ((match = templateRegex.exec(value)) !== null) {
+          variables.add(match[1].trim());
+        }
+      } else if (typeof value === 'object' && value !== null) {
+        Object.values(value).forEach(processValue);
+      }
+    };
+    
+    processValue(input);
+    return variables;
+  }
+  
+  /**
+   * Build dependency graph for tool execution order
+   * @param {ToolCall[]} tools - Array of tool calls
+   * @returns {Object} Dependency graph and execution order
+   */
+  static buildDependencyGraph(tools) {
+    const dependencies = new Map();
+    const toolIds = new Set(tools.map(tool => tool.id));
+    
+    // Extract dependencies for each tool
+    tools.forEach(tool => {
+      const variables = this.extractVariables(tool.function?.arguments || {});
+      const deps = Array.from(variables).filter(variable => {
+        const toolId = variable.split('.')[0];
+        return toolIds.has(toolId);
+      });
+      dependencies.set(tool.id, deps);
+    });
+    
+    // Topological sort to determine execution order
+    const visited = new Set();
+    const temp = new Set();
+    const order = [];
+    
+    const visit = (toolId) => {
+      if (temp.has(toolId)) {
+        throw new Error(`Circular dependency detected involving tool: ${toolId}`);
+      }
+      if (!visited.has(toolId)) {
+        temp.add(toolId);
+        const deps = dependencies.get(toolId) || [];
+        deps.forEach(dep => {
+          const depToolId = dep.split('.')[0];
+          if (toolIds.has(depToolId)) {
+            visit(depToolId);
+          }
+        });
+        temp.delete(toolId);
+        visited.add(toolId);
+        order.push(toolId);
+      }
+    };
+    
+    tools.forEach(tool => visit(tool.id));
+    
+    return { dependencies, order };
+  }
+  
+  /**
+   * Process template variables in tool arguments
+   * @param {Object} args - Tool arguments that may contain templates
+   * @param {Object} context - Available variables for substitution  
+   * @returns {Object} Processed arguments with templates resolved
+   */
+  static processArguments(args, context) {
+    if (!args || typeof args !== 'object') {
+      return args;
+    }
+    
+    const processValue = (value) => {
+      if (typeof value === 'string') {
+        // Check if it's a pure template reference (entire string is one template)
+        const pureTemplateMatch = value.match(/^\{\{\s*([^}]+)\s*\}\}$/);
+        if (pureTemplateMatch) {
+          const varPath = pureTemplateMatch[1].trim();
+          const result = this.resolveVariable(varPath, context);
+          return result !== undefined ? result : value;
+        }
+        
+        // Process inline templates within strings
+        return templateEnv.renderString(value, context);
+      } else if (Array.isArray(value)) {
+        return value.map(processValue);
+      } else if (typeof value === 'object' && value !== null) {
+        const processed = {};
+        Object.entries(value).forEach(([key, val]) => {
+          processed[key] = processValue(val);
+        });
+        return processed;
+      }
+      return value;
+    };
+    
+    return processValue(args);
+  }
+  
+  /**
+   * Resolve a variable path like "tool_id.result.field" from context
+   * @param {string} varPath - Variable path to resolve
+   * @param {Object} context - Context object containing tool results
+   * @returns {any} Resolved value or undefined
+   */
+  static resolveVariable(varPath, context) {
+    const parts = varPath.split('.');
+    let current = context;
+    
+    for (const part of parts) {
+      if (current === null || current === undefined || typeof current !== 'object') {
+        return undefined;
+      }
+      current = current[part];
+    }
+    
+    return current;
+  }
+}
 
 /**
  * @typedef {Object} ToolCall
@@ -62,235 +202,34 @@ const DEFAULT_CONFIG = {
   temperature: 0.7
 };
 
-const SYSTEM_PROMPT = `You are AIMaster (AIM), an intelligent AI assistant that responds in pure JSON format. You have FULL COMMAND-LINE ACCESS through tools - use this power proactively!
+const SYSTEM_PROMPT = `You are AIMaster (AIM). RESPOND WITH RAW JSON ONLY - NO MARKDOWN, NO CODE BLOCKS.
 
-CRITICAL INSTRUCTIONS:
-1. ALWAYS respond with valid JSON only - no markdown, no explanations outside JSON
-2. Your response must follow this exact structure (IMPORTANT - thoughts MUST come first):
-{
-  "thoughts": "your internal reasoning and step-by-step analysis - be detailed and show your thinking process",
-  "content": "your main response here", 
-  "reasoning": "optional reasoning for your response",
-  "tools": [optional array of tool calls]
-}
+FORMAT: {"thoughts": "reasoning", "content": "response", "tools": [optional]}
 
-3. When you need to use tools, include them in the "tools" array with this structure:
-{
-  "id": "unique_call_id",
-  "type": "function", 
-  "function": {
-    "name": "function_name",
-    "arguments": {"param1": "value1", "param2": "value2"}
-  }
-}
+TOOLS:
+- execute_shell_command: {"command": "shell command"}
+- read_file: {"file_path": "path"}
+- write_file: {"file_path": "path", "content": "text"}
+- append_to_file: {"file_path": "path", "content": "text"}
+- list_directory: {"directory_path": "path", "detailed": false}
+- create_directory: {"directory_path": "path", "recursive": true}
+- copy_files: {"source": "path", "destination": "path"}
+- move_files: {"source": "path", "destination": "path"}
+- delete_file: {"file_path": "path"}
+- get_file_info: {"file_path": "path"}
+- search_files: {"search_path": "path", "pattern": "*.js", "recursive": true}
+- find_and_replace: {"search_path": "path", "search_text": "old", "replace_text": "new", "file_pattern": "*.js", "recursive": true}
+- ripgrep_search: {"pattern": "regex", "search_path": "path", "options": {"fileType": "js"}}
+- todo_read: {}
+- todo_write: {"todos": [{"content": "task", "status": "pending", "priority": "high"}]}
+- browser_navigate: {"url": "https://example.com", "waitFor": "networkidle", "screenshot": false, "extractData": {"title": "h1", "links": "a[href]"}}
+- browser_interact: {"actions": [{"type": "click", "selector": ".button"}, {"type": "type", "selector": "input", "text": "query"}, {"type": "wait", "selector": ".results"}]}
+- http_fetch: {"url": "https://api.example.com", "method": "GET", "headers": {"Authorization": "Bearer token"}, "data": {}}
 
-4. Available tools:
-   - execute_shell_command: Execute ANY shell/terminal command including git operations, package management, build commands, system info, etc. You have full system access - USE IT!
-     Arguments: {"command": "shell command to execute"}
-   
-   - read_file: Read content from a file (cross-platform)
-     Arguments: {"file_path": "path/to/file.txt"}
-   
-   - write_file: Write content to a file (creates parent directories if needed)
-     Arguments: {"file_path": "path/to/file.txt", "content": "file content here"}
-   
-   - append_to_file: Append content to an existing file or create new one
-     Arguments: {"file_path": "path/to/file.txt", "content": "content to append"}
-   
-   - list_directory: List directory contents with optional detailed info
-     Arguments: {"directory_path": "path/to/directory", "detailed": false}
-   
-   - create_directory: Create a directory (with parent directories if needed)
-     Arguments: {"directory_path": "path/to/new/directory", "recursive": true}
-   
-   - copy_files: Copy files or directories to another location
-     Arguments: {"source": "path/to/source", "destination": "path/to/destination"}
-   
-   - move_files: Move/rename files or directories
-     Arguments: {"source": "path/to/source", "destination": "path/to/destination"}
-   
-   - delete_file: Delete a file
-     Arguments: {"file_path": "path/to/file.txt"}
-   
-   - get_file_info: Get detailed information about a file or directory
-     Arguments: {"file_path": "path/to/file"}
-   
-   - search_files: Search for files by name pattern (supports * and ? wildcards)
-     Arguments: {"search_path": "path/to/search", "pattern": "*.js", "recursive": true}
-   
-   - find_and_replace: Find and replace text in files matching a pattern
-     Arguments: {"search_path": "path/to/search", "search_text": "old text", "replace_text": "new text", "file_pattern": "*.js", "recursive": true}
-   
-   - ripgrep_search: Advanced code search with regex support (requires ripgrep/rg command)
-     Arguments: {"pattern": "regex_pattern", "search_path": "path/to/search", "options": {"fileType": "js", "ignoreCase": true, "contextLines": 2, "wholeWord": false}}
-   
-   - todo_read: Read the current todo list from persistent storage
-     Arguments: {} (no arguments needed)
-   
-   - todo_write: Write/update the todo list to persistent storage
-     Arguments: {"todos": [{"content": "task description", "status": "pending|in_progress|completed", "priority": "low|medium|high"}]}
+TOOL CHAINING: Use {{tool_id.field}} to reference previous tool results.
+Example: {"id": "t1", "function": {"name": "list_directory", "arguments": {"directory_path": "./src"}}}, {"id": "t2", "function": {"name": "write_file", "arguments": {"file_path": "./report.txt", "content": "Found {{t1.count}} files"}}}
 
-5. EXPLORATION GUIDELINES - BE PROACTIVE:
-   - When asked about "current project" or "this directory" → IMMEDIATELY explore with commands
-   - When users want analysis → USE TOOLS to gather data first, then analyze
-   - Don't assume you lack information - DISCOVER IT with shell commands
-   - Common exploration commands: pwd, ls -la, cat README.md, git status, npm list, etc.
-
-6. Tool call examples:
-
-   Example 1 - Project exploration:
-   {
-     "thoughts": "The user is asking about the current project. I should explore the directory structure to understand what we're working with. I'll start by checking the current directory, listing files, and reading any README to get context.",
-     "content": "Let me explore the current project structure and tell you about it",
-     "reasoning": "User wants to know about current project, so I'll explore the directory structure and read key files",
-     "tools": [
-       {
-         "id": "explore_pwd",
-         "type": "function",
-         "function": {"name": "execute_shell_command", "arguments": {"command": "pwd"}}
-       },
-       {
-         "id": "explore_files",
-         "type": "function", 
-         "function": {"name": "execute_shell_command", "arguments": {"command": "ls -la"}}
-       },
-       {
-         "id": "read_readme",
-         "type": "function",
-         "function": {"name": "execute_shell_command", "arguments": {"command": "cat README.md"}}
-       }
-     ]
-   }
-
-   Example 2 - Git repository analysis:
-   {
-     "thoughts": "I need to analyze the git repository. I should check the current git status to see if there are any uncommitted changes, and look at recent commit history to understand the project's development.",
-     "content": "I'll analyze this git repository for you",
-     "tools": [
-       {
-         "id": "git_status",
-         "type": "function",
-         "function": {"name": "execute_shell_command", "arguments": {"command": "git status"}}
-       },
-       {
-         "id": "git_log",
-         "type": "function",
-         "function": {"name": "execute_shell_command", "arguments": {"command": "git log --oneline -10"}}
-       }
-     ]
-   }
-
-   Example 3 - Package analysis:
-   {
-     "thoughts": "To understand this project better, I should examine the package.json file to see what dependencies are used, what scripts are available, and what the project structure looks like.",
-     "content": "Let me check the dependencies and scripts in this project",
-     "tools": [
-       {
-         "id": "read_package",
-         "type": "function",
-         "function": {"name": "execute_shell_command", "arguments": {"command": "cat package.json"}}
-       }
-     ]
-   }
-
-   Example 4 - File operations:
-   {
-     "thoughts": "The user wants to create a new configuration file. I should first check if the directory exists, then write the configuration content to the file.",
-     "content": "I'll create the configuration file for you",
-     "tools": [
-       {
-         "id": "check_dir",
-         "type": "function",
-         "function": {"name": "list_directory", "arguments": {"directory_path": "./config"}}
-       },
-       {
-         "id": "create_config",
-         "type": "function",
-         "function": {"name": "write_file", "arguments": {"file_path": "./config/app.json", "content": "{\"port\": 3000, \"debug\": true}"}}
-       }
-     ]
-   }
-
-   Example 5 - Search and replace:
-   {
-     "thoughts": "The user wants to update all JavaScript files to use a new API endpoint. I should search for files with the old endpoint and replace it with the new one.",
-     "content": "I'll find and replace the API endpoint in all JavaScript files",
-     "tools": [
-       {
-         "id": "search_js_files",
-         "type": "function",
-         "function": {"name": "search_files", "arguments": {"search_path": "./src", "pattern": "*.js", "recursive": true}}
-       },
-       {
-         "id": "replace_endpoint",
-         "type": "function",
-         "function": {"name": "find_and_replace", "arguments": {"search_path": "./src", "search_text": "api.old-domain.com", "replace_text": "api.new-domain.com", "file_pattern": "*.js", "recursive": true}}
-       }
-     ]
-   }
-
-   Example 6 - Advanced code search:
-   {
-     "thoughts": "I need to find all function definitions in the JavaScript codebase. This is perfect for ripgrep since it can search with regex patterns and show context around matches.",
-     "content": "I'll search for function definitions in your JavaScript code",
-     "tools": [
-       {
-         "id": "search_functions",
-         "type": "function",
-         "function": {"name": "ripgrep_search", "arguments": {"pattern": "function\\s+\\w+", "search_path": "./src", "options": {"fileType": "js", "contextLines": 2}}}
-       }
-     ]
-   }
-
-   Example 7 - Todo management:
-   {
-     "thoughts": "The user wants me to implement a new feature. I should break this down into manageable tasks and track them using the todo system. Let me first check if there are existing todos, then add new ones for this feature.",
-     "content": "I'll break down this feature implementation into manageable tasks",
-     "tools": [
-       {
-         "id": "check_todos",
-         "type": "function",
-         "function": {"name": "todo_read", "arguments": {}}
-       },
-       {
-         "id": "add_tasks",
-         "type": "function",
-         "function": {"name": "todo_write", "arguments": {"todos": [{"content": "Design API endpoints", "status": "pending", "priority": "high"}, {"content": "Implement authentication", "status": "pending", "priority": "high"}, {"content": "Write unit tests", "status": "pending", "priority": "medium"}]}}
-       }
-     ]
-   }
-
-7. Tool call guidelines:
-   - Each tool call must have a unique ID
-   - Function arguments must be valid JSON objects
-   - Be specific and clear about what each tool call should accomplish
-   - You can make multiple tool calls in a single response
-   - For shell commands, be careful and consider security implications
-   - ALWAYS explore before claiming you don't have information
-
-8. Response guidelines:
-   - Keep "content" concise but informative
-   - Use "reasoning" to explain your thought process if helpful
-   - Use "thoughts" for internal analysis, planning, and deeper reasoning
-   - Ensure all JSON is properly escaped and valid
-   - Never include any text outside the JSON structure
-
-9. Todo system usage:
-   - Use todo_read to check current tasks before starting work
-   - Use todo_write to break down complex requests into manageable tasks
-   - Update todo status as you complete work (pending → in_progress → completed)
-   - Use todos to track multi-step processes and show progress to users
-   - Todos persist between sessions - great for long-running projects
-
-10. Thinking guidelines (CRITICAL - thoughts come first and stream first):
-   - ALWAYS start with detailed "thoughts" - this streams to users first so they see your reasoning
-   - Use "thoughts" to show your internal reasoning process step by step
-   - Break down complex problems methodically in thoughts
-   - Consider multiple approaches and weigh pros/cons in thoughts
-   - Think through potential issues or edge cases
-   - Be detailed in thoughts - users love seeing AI reasoning in real-time
-
-Remember: You are AIMaster, designed to be a POWERFUL, tool-enabled AI assistant with full command-line access. Be helpful, accurate, PROACTIVE in using tools, and always maintain the JSON response format.`;
+Be proactive, explore with tools, and maintain JSON format.`;
 
 /**
  * Logger utility with JSON output and timestamps
@@ -1179,6 +1118,237 @@ async function todoWrite(todos, logger) {
 }
 
 /**
+ * Navigate to a URL with a browser and extract data
+ * @param {string} url - URL to navigate to
+ * @param {string} waitFor - Wait condition (networkidle, domcontentloaded, load)
+ * @param {boolean} screenshot - Whether to take a screenshot
+ * @param {Object} extractData - Selectors for data extraction
+ * @param {Logger} logger - Logger instance
+ * @returns {Promise<Object>} Operation result
+ */
+async function browserNavigate(url, waitFor = 'networkidle', screenshot = false, extractData = {}, logger) {
+  let browser = null;
+  try {
+    logger.debug('Starting browser navigation:', { url, waitFor, screenshot });
+    
+    browser = await chromium.launch({ headless: true });
+    const context = await browser.newContext();
+    const page = await context.newPage();
+    
+    // Navigate to the URL
+    await page.goto(url, { waitUntil: waitFor, timeout: 30000 });
+    
+    // Extract data based on selectors
+    const extracted = {};
+    for (const [key, selector] of Object.entries(extractData)) {
+      try {
+        if (selector.endsWith('[href]') || selector.endsWith('[src]')) {
+          // Extract attribute values
+          const attr = selector.includes('[href]') ? 'href' : 'src';
+          const baseSelector = selector.replace(/\[.*\]$/, '');
+          const elements = await page.$$eval(baseSelector, (els, attribute) => 
+            els.map(el => el.getAttribute(attribute)).filter(Boolean), attr);
+          extracted[key] = elements;
+        } else {
+          // Extract text content
+          const elements = await page.$$eval(selector, els => 
+            els.map(el => el.textContent.trim()).filter(Boolean));
+          extracted[key] = elements.length === 1 ? elements[0] : elements;
+        }
+      } catch (extractError) {
+        extracted[key] = null;
+        logger.warn(`Failed to extract ${key}:`, extractError.message);
+      }
+    }
+    
+    // Take screenshot if requested
+    let screenshotPath = null;
+    if (screenshot) {
+      screenshotPath = path.resolve(`./screenshot_${Date.now()}.png`);
+      await page.screenshot({ path: screenshotPath, fullPage: true });
+    }
+    
+    await browser.close();
+    
+    return {
+      url,
+      title: await page.title(),
+      extractedData: extracted,
+      screenshotPath,
+      success: true
+    };
+    
+  } catch (error) {
+    if (browser) {
+      await browser.close().catch(() => {});
+    }
+    logger.error('Browser navigation failed:', error.message);
+    return {
+      url,
+      error: error.message,
+      success: false
+    };
+  }
+}
+
+/**
+ * Perform browser interactions (clicks, typing, etc.)
+ * @param {Array} actions - Array of actions to perform
+ * @param {Logger} logger - Logger instance
+ * @returns {Promise<Object>} Operation result
+ */
+async function browserInteract(actions, logger) {
+  let browser = null;
+  try {
+    logger.debug('Starting browser interactions:', { actionCount: actions.length });
+    
+    browser = await chromium.launch({ headless: true });
+    const context = await browser.newContext();
+    const page = await context.newPage();
+    
+    const results = [];
+    
+    for (const action of actions) {
+      try {
+        switch (action.type) {
+          case 'goto':
+            await page.goto(action.url, { waitUntil: action.waitFor || 'networkidle', timeout: 30000 });
+            results.push({ type: 'goto', url: action.url, success: true });
+            break;
+            
+          case 'click':
+            await page.click(action.selector, { timeout: 10000 });
+            results.push({ type: 'click', selector: action.selector, success: true });
+            break;
+            
+          case 'type':
+            await page.fill(action.selector, action.text);
+            results.push({ type: 'type', selector: action.selector, text: action.text, success: true });
+            break;
+            
+          case 'wait':
+            if (action.selector) {
+              await page.waitForSelector(action.selector, { timeout: 10000 });
+              results.push({ type: 'wait', selector: action.selector, success: true });
+            } else if (action.timeout) {
+              await page.waitForTimeout(action.timeout);
+              results.push({ type: 'wait', timeout: action.timeout, success: true });
+            }
+            break;
+            
+          case 'extract':
+            const extracted = {};
+            for (const [key, selector] of Object.entries(action.data || {})) {
+              try {
+                const elements = await page.$$eval(selector, els => 
+                  els.map(el => el.textContent.trim()).filter(Boolean));
+                extracted[key] = elements.length === 1 ? elements[0] : elements;
+              } catch (extractError) {
+                extracted[key] = null;
+              }
+            }
+            results.push({ type: 'extract', data: extracted, success: true });
+            break;
+            
+          case 'screenshot':
+            const screenshotPath = path.resolve(`./screenshot_${Date.now()}.png`);
+            await page.screenshot({ path: screenshotPath, fullPage: action.fullPage || false });
+            results.push({ type: 'screenshot', path: screenshotPath, success: true });
+            break;
+            
+          default:
+            results.push({ type: action.type, error: 'Unknown action type', success: false });
+        }
+      } catch (actionError) {
+        results.push({ 
+          type: action.type, 
+          error: actionError.message, 
+          success: false 
+        });
+      }
+    }
+    
+    await browser.close();
+    
+    return {
+      actions: results,
+      totalActions: actions.length,
+      successfulActions: results.filter(r => r.success).length,
+      success: true
+    };
+    
+  } catch (error) {
+    if (browser) {
+      await browser.close().catch(() => {});
+    }
+    logger.error('Browser interaction failed:', error.message);
+    return {
+      actions: [],
+      error: error.message,
+      success: false
+    };
+  }
+}
+
+/**
+ * Perform HTTP fetch request
+ * @param {string} url - URL to fetch
+ * @param {string} method - HTTP method (GET, POST, etc.)
+ * @param {Object} headers - Request headers
+ * @param {Object} data - Request body data
+ * @param {Logger} logger - Logger instance
+ * @returns {Promise<Object>} Operation result
+ */
+async function httpFetch(url, method = 'GET', headers = {}, data = null, logger) {
+  try {
+    logger.debug('Making HTTP request:', { url, method });
+    
+    const config = {
+      method,
+      headers: {
+        'User-Agent': 'AIMaster-Agent/1.0',
+        ...headers
+      },
+      timeout: 30000
+    };
+    
+    if (data && method !== 'GET') {
+      if (typeof data === 'object') {
+        config.data = data;
+        config.headers['Content-Type'] = config.headers['Content-Type'] || 'application/json';
+      } else {
+        config.data = data;
+      }
+    }
+    
+    const response = await axios(url, config);
+    
+    return {
+      url,
+      method,
+      status: response.status,
+      statusText: response.statusText,
+      headers: response.headers,
+      data: response.data,
+      size: JSON.stringify(response.data).length,
+      success: true
+    };
+    
+  } catch (error) {
+    logger.error('HTTP fetch failed:', error.message);
+    
+    return {
+      url,
+      method,
+      status: error.response?.status || 0,
+      statusText: error.response?.statusText || 'Error',
+      error: error.message,
+      success: false
+    };
+  }
+}
+
+/**
  * Get creative logging message for tool usage
  * @param {string} toolName - Name of the tool being used
  * @param {Object} args - Tool arguments
@@ -1279,6 +1449,24 @@ function getToolLogMessage(toolName, args, result, interactive = false) {
       const writtenCount = result?.count || 0;
       const addedCount = args?.todos?.length || 0;
       return `${prefix} updated todos (${writtenCount} items, ${addedCount} changes)`;
+
+    case 'browser_navigate':
+      const navUrl = args?.url || 'unknown URL';
+      const navDomain = new URL(navUrl).hostname;
+      const extracted = Object.keys(result?.extractedData || {}).length;
+      return `${prefix} navigated to ${navDomain} (extracted ${extracted} data fields)`;
+
+    case 'browser_interact':
+      const actionCount = args?.actions?.length || 0;
+      const successCount = result?.successfulActions || 0;
+      return `${prefix} performed ${successCount}/${actionCount} browser actions`;
+
+    case 'http_fetch':
+      const fetchUrl = args?.url || 'unknown URL';
+      const fetchDomain = new URL(fetchUrl).hostname;
+      const status = result?.status || 0;
+      const responseSize = result?.size || 0;
+      return `${prefix} fetched ${fetchDomain} (${status}, ${responseSize} bytes)`;
       
     default:
       return `${prefix} used ${toolName}`;
@@ -1298,6 +1486,7 @@ async function executeTools(tools, logger, interactive = false) {
   }
   
   const results = [];
+  const templateContext = {}; // Store tool results for templating
   
   // Helper function to log tool usage and add to results
   const logAndAddResult = (toolName, args, result, toolId, error = null) => {
@@ -1318,156 +1507,379 @@ async function executeTools(tools, logger, interactive = false) {
       resultObj.error = error;
     } else {
       resultObj.result = result;
+      // Store successful results in template context for subsequent tools
+      templateContext[toolId] = result;
     }
     
     results.push(resultObj);
   };
   
-  for (const tool of tools) {
-    const toolName = tool.function?.name;
-    const args = tool.function?.arguments || {};
+  try {
+    // Build dependency graph and determine execution order
+    const { order } = TemplateProcessor.buildDependencyGraph(tools);
     
-    try {
-      let result = null;
+    // Create a map for quick tool lookup by ID
+    const toolMap = new Map();
+    tools.forEach(tool => toolMap.set(tool.id, tool));
+    
+    // Execute tools in dependency order
+    for (const toolId of order) {
+      const tool = toolMap.get(toolId);
+      if (!tool) continue;
       
-      switch (toolName) {
-        case 'execute_shell_command':
-          if (!args?.command) {
-            logAndAddResult(toolName, args, null, tool.id, 'No command provided');
+      const toolName = tool.function?.name;
+      let args = tool.function?.arguments || {};
+      
+      try {
+        // Process template variables in arguments
+        args = TemplateProcessor.processArguments(args, templateContext);
+        
+        let result = null;
+        
+        switch (toolName) {
+          case 'execute_shell_command':
+            if (!args?.command) {
+              logAndAddResult(toolName, args, null, tool.id, 'No command provided');
+              break;
+            }
+            result = await executeShellCommand(args.command, logger);
+            logAndAddResult(toolName, args, result, tool.id);
             break;
-          }
-          result = await executeShellCommand(args.command, logger);
-          logAndAddResult(toolName, args, result, tool.id);
-          break;
 
-        case 'read_file':
-          if (!args?.file_path) {
-            logAndAddResult(toolName, args, null, tool.id, 'No file_path provided');
+          case 'read_file':
+            if (!args?.file_path) {
+              logAndAddResult(toolName, args, null, tool.id, 'No file_path provided');
+              break;
+            }
+            result = await readFile(args.file_path, logger);
+            logAndAddResult(toolName, args, result, tool.id);
             break;
-          }
-          result = await readFile(args.file_path, logger);
-          logAndAddResult(toolName, args, result, tool.id);
-          break;
 
-        case 'write_file':
-          if (!args?.file_path || args?.content === undefined) {
-            logAndAddResult(toolName, args, null, tool.id, 'file_path and content are required');
+          case 'write_file':
+            if (!args?.file_path || args?.content === undefined) {
+              logAndAddResult(toolName, args, null, tool.id, 'file_path and content are required');
+              break;
+            }
+            result = await writeFile(args.file_path, args.content, logger);
+            logAndAddResult(toolName, args, result, tool.id);
             break;
-          }
-          result = await writeFile(args.file_path, args.content, logger);
-          logAndAddResult(toolName, args, result, tool.id);
-          break;
 
-        case 'append_to_file':
-          if (!args?.file_path || args?.content === undefined) {
-            logAndAddResult(toolName, args, null, tool.id, 'file_path and content are required');
+          case 'append_to_file':
+            if (!args?.file_path || args?.content === undefined) {
+              logAndAddResult(toolName, args, null, tool.id, 'file_path and content are required');
+              break;
+            }
+            result = await appendToFile(args.file_path, args.content, logger);
+            logAndAddResult(toolName, args, result, tool.id);
             break;
-          }
-          result = await appendToFile(args.file_path, args.content, logger);
-          logAndAddResult(toolName, args, result, tool.id);
-          break;
 
-        case 'list_directory':
-          if (!args?.directory_path) {
-            logAndAddResult(toolName, args, null, tool.id, 'directory_path is required');
+          case 'list_directory':
+            if (!args?.directory_path) {
+              logAndAddResult(toolName, args, null, tool.id, 'directory_path is required');
+              break;
+            }
+            result = await listDirectory(args.directory_path, args.detailed || false, logger);
+            logAndAddResult(toolName, args, result, tool.id);
             break;
-          }
-          result = await listDirectory(args.directory_path, args.detailed || false, logger);
-          logAndAddResult(toolName, args, result, tool.id);
-          break;
 
-        case 'create_directory':
-          if (!args?.directory_path) {
-            logAndAddResult(toolName, args, null, tool.id, 'directory_path is required');
+          case 'create_directory':
+            if (!args?.directory_path) {
+              logAndAddResult(toolName, args, null, tool.id, 'directory_path is required');
+              break;
+            }
+            result = await createDirectory(args.directory_path, args.recursive !== false, logger);
+            logAndAddResult(toolName, args, result, tool.id);
             break;
-          }
-          result = await createDirectory(args.directory_path, args.recursive !== false, logger);
-          logAndAddResult(toolName, args, result, tool.id);
-          break;
 
-        case 'copy_files':
-          if (!args?.source || !args?.destination) {
-            logAndAddResult(toolName, args, null, tool.id, 'source and destination are required');
+          case 'copy_files':
+            if (!args?.source || !args?.destination) {
+              logAndAddResult(toolName, args, null, tool.id, 'source and destination are required');
+              break;
+            }
+            result = await copyFiles(args.source, args.destination, logger);
+            logAndAddResult(toolName, args, result, tool.id);
             break;
-          }
-          result = await copyFiles(args.source, args.destination, logger);
-          logAndAddResult(toolName, args, result, tool.id);
-          break;
 
-        case 'move_files':
-          if (!args?.source || !args?.destination) {
-            logAndAddResult(toolName, args, null, tool.id, 'source and destination are required');
+          case 'move_files':
+            if (!args?.source || !args?.destination) {
+              logAndAddResult(toolName, args, null, tool.id, 'source and destination are required');
+              break;
+            }
+            result = await moveFiles(args.source, args.destination, logger);
+            logAndAddResult(toolName, args, result, tool.id);
             break;
-          }
-          result = await moveFiles(args.source, args.destination, logger);
-          logAndAddResult(toolName, args, result, tool.id);
-          break;
 
-        case 'delete_file':
-          if (!args?.file_path) {
-            logAndAddResult(toolName, args, null, tool.id, 'file_path is required');
+          case 'delete_file':
+            if (!args?.file_path) {
+              logAndAddResult(toolName, args, null, tool.id, 'file_path is required');
+              break;
+            }
+            result = await deleteFile(args.file_path, logger);
+            logAndAddResult(toolName, args, result, tool.id);
             break;
-          }
-          result = await deleteFile(args.file_path, logger);
-          logAndAddResult(toolName, args, result, tool.id);
-          break;
 
-        case 'get_file_info':
-          if (!args?.file_path) {
-            logAndAddResult(toolName, args, null, tool.id, 'file_path is required');
+          case 'get_file_info':
+            if (!args?.file_path) {
+              logAndAddResult(toolName, args, null, tool.id, 'file_path is required');
+              break;
+            }
+            result = await getFileInfo(args.file_path, logger);
+            logAndAddResult(toolName, args, result, tool.id);
             break;
-          }
-          result = await getFileInfo(args.file_path, logger);
-          logAndAddResult(toolName, args, result, tool.id);
-          break;
 
-        case 'search_files':
-          if (!args?.search_path || !args?.pattern) {
-            logAndAddResult(toolName, args, null, tool.id, 'search_path and pattern are required');
+          case 'search_files':
+            if (!args?.search_path || !args?.pattern) {
+              logAndAddResult(toolName, args, null, tool.id, 'search_path and pattern are required');
+              break;
+            }
+            result = await searchFiles(args.search_path, args.pattern, args.recursive !== false, logger);
+            logAndAddResult(toolName, args, result, tool.id);
             break;
-          }
-          result = await searchFiles(args.search_path, args.pattern, args.recursive !== false, logger);
-          logAndAddResult(toolName, args, result, tool.id);
-          break;
 
-        case 'find_and_replace':
-          if (!args?.search_path || !args?.search_text || args?.replace_text === undefined) {
-            logAndAddResult(toolName, args, null, tool.id, 'search_path, search_text, and replace_text are required');
+          case 'find_and_replace':
+            if (!args?.search_path || !args?.search_text || args?.replace_text === undefined) {
+              logAndAddResult(toolName, args, null, tool.id, 'search_path, search_text, and replace_text are required');
+              break;
+            }
+            result = await findAndReplace(args.search_path, args.search_text, args.replace_text, args.file_pattern || '*', args.recursive !== false, logger);
+            logAndAddResult(toolName, args, result, tool.id);
             break;
-          }
-          result = await findAndReplace(args.search_path, args.search_text, args.replace_text, args.file_pattern || '*', args.recursive !== false, logger);
-          logAndAddResult(toolName, args, result, tool.id);
-          break;
 
-        case 'ripgrep_search':
-          if (!args?.pattern) {
-            logAndAddResult(toolName, args, null, tool.id, 'pattern is required');
+          case 'ripgrep_search':
+            if (!args?.pattern) {
+              logAndAddResult(toolName, args, null, tool.id, 'pattern is required');
+              break;
+            }
+            result = await ripgrepSearch(args.pattern, args.search_path || '.', args.options || {}, logger);
+            logAndAddResult(toolName, args, result, tool.id);
             break;
-          }
-          result = await ripgrepSearch(args.pattern, args.search_path || '.', args.options || {}, logger);
-          logAndAddResult(toolName, args, result, tool.id);
-          break;
 
-        case 'todo_read':
-          result = await todoRead(logger);
-          logAndAddResult(toolName, args, result, tool.id);
-          break;
-
-        case 'todo_write':
-          if (!args?.todos || !Array.isArray(args.todos)) {
-            logAndAddResult(toolName, args, null, tool.id, 'todos array is required');
+          case 'todo_read':
+            result = await todoRead(logger);
+            logAndAddResult(toolName, args, result, tool.id);
             break;
-          }
-          result = await todoWrite(args.todos, logger);
-          logAndAddResult(toolName, args, result, tool.id);
-          break;
-          
-        default:
-          logAndAddResult(toolName, args, null, tool.id, `Unknown tool: ${toolName}`);
+
+          case 'todo_write':
+            if (!args?.todos || !Array.isArray(args.todos)) {
+              logAndAddResult(toolName, args, null, tool.id, 'todos array is required');
+              break;
+            }
+            result = await todoWrite(args.todos, logger);
+            logAndAddResult(toolName, args, result, tool.id);
+            break;
+
+          case 'browser_navigate':
+            if (!args?.url) {
+              logAndAddResult(toolName, args, null, tool.id, 'url is required');
+              break;
+            }
+            result = await browserNavigate(args.url, args.waitFor, args.screenshot, args.extractData || {}, logger);
+            logAndAddResult(toolName, args, result, tool.id);
+            break;
+
+          case 'browser_interact':
+            if (!args?.actions || !Array.isArray(args.actions)) {
+              logAndAddResult(toolName, args, null, tool.id, 'actions array is required');
+              break;
+            }
+            result = await browserInteract(args.actions, logger);
+            logAndAddResult(toolName, args, result, tool.id);
+            break;
+
+          case 'http_fetch':
+            if (!args?.url) {
+              logAndAddResult(toolName, args, null, tool.id, 'url is required');
+              break;
+            }
+            result = await httpFetch(args.url, args.method, args.headers, args.data, logger);
+            logAndAddResult(toolName, args, result, tool.id);
+            break;
+            
+          default:
+            logAndAddResult(toolName, args, null, tool.id, `Unknown tool: ${toolName}`);
+        }
+      } catch (error) {
+        logger.error('Tool execution error', { toolId: tool.id, error: error.message });
+        logAndAddResult(toolName, args, null, tool.id, error.message);
       }
-    } catch (error) {
-      logger.error('Tool execution error', { toolId: tool.id, error: error.message });
-      logAndAddResult(toolName, args, null, tool.id, error.message);
+    }
+  } catch (dependencyError) {
+    // If dependency resolution fails, fall back to original sequential execution
+    logger.warn('Template dependency resolution failed, falling back to sequential execution', { error: dependencyError.message });
+    
+    for (const tool of tools) {
+      const toolName = tool.function?.name;
+      const args = tool.function?.arguments || {};
+      
+      try {
+        let result = null;
+        
+        switch (toolName) {
+          case 'execute_shell_command':
+            if (!args?.command) {
+              logAndAddResult(toolName, args, null, tool.id, 'No command provided');
+              break;
+            }
+            result = await executeShellCommand(args.command, logger);
+            logAndAddResult(toolName, args, result, tool.id);
+            break;
+
+          case 'read_file':
+            if (!args?.file_path) {
+              logAndAddResult(toolName, args, null, tool.id, 'No file_path provided');
+              break;
+            }
+            result = await readFile(args.file_path, logger);
+            logAndAddResult(toolName, args, result, tool.id);
+            break;
+
+          case 'write_file':
+            if (!args?.file_path || args?.content === undefined) {
+              logAndAddResult(toolName, args, null, tool.id, 'file_path and content are required');
+              break;
+            }
+            result = await writeFile(args.file_path, args.content, logger);
+            logAndAddResult(toolName, args, result, tool.id);
+            break;
+
+          case 'append_to_file':
+            if (!args?.file_path || args?.content === undefined) {
+              logAndAddResult(toolName, args, null, tool.id, 'file_path and content are required');
+              break;
+            }
+            result = await appendToFile(args.file_path, args.content, logger);
+            logAndAddResult(toolName, args, result, tool.id);
+            break;
+
+          case 'list_directory':
+            if (!args?.directory_path) {
+              logAndAddResult(toolName, args, null, tool.id, 'directory_path is required');
+              break;
+            }
+            result = await listDirectory(args.directory_path, args.detailed || false, logger);
+            logAndAddResult(toolName, args, result, tool.id);
+            break;
+
+          case 'create_directory':
+            if (!args?.directory_path) {
+              logAndAddResult(toolName, args, null, tool.id, 'directory_path is required');
+              break;
+            }
+            result = await createDirectory(args.directory_path, args.recursive !== false, logger);
+            logAndAddResult(toolName, args, result, tool.id);
+            break;
+
+          case 'copy_files':
+            if (!args?.source || !args?.destination) {
+              logAndAddResult(toolName, args, null, tool.id, 'source and destination are required');
+              break;
+            }
+            result = await copyFiles(args.source, args.destination, logger);
+            logAndAddResult(toolName, args, result, tool.id);
+            break;
+
+          case 'move_files':
+            if (!args?.source || !args?.destination) {
+              logAndAddResult(toolName, args, null, tool.id, 'source and destination are required');
+              break;
+            }
+            result = await moveFiles(args.source, args.destination, logger);
+            logAndAddResult(toolName, args, result, tool.id);
+            break;
+
+          case 'delete_file':
+            if (!args?.file_path) {
+              logAndAddResult(toolName, args, null, tool.id, 'file_path is required');
+              break;
+            }
+            result = await deleteFile(args.file_path, logger);
+            logAndAddResult(toolName, args, result, tool.id);
+            break;
+
+          case 'get_file_info':
+            if (!args?.file_path) {
+              logAndAddResult(toolName, args, null, tool.id, 'file_path is required');
+              break;
+            }
+            result = await getFileInfo(args.file_path, logger);
+            logAndAddResult(toolName, args, result, tool.id);
+            break;
+
+          case 'search_files':
+            if (!args?.search_path || !args?.pattern) {
+              logAndAddResult(toolName, args, null, tool.id, 'search_path and pattern are required');
+              break;
+            }
+            result = await searchFiles(args.search_path, args.pattern, args.recursive !== false, logger);
+            logAndAddResult(toolName, args, result, tool.id);
+            break;
+
+          case 'find_and_replace':
+            if (!args?.search_path || !args?.search_text || args?.replace_text === undefined) {
+              logAndAddResult(toolName, args, null, tool.id, 'search_path, search_text, and replace_text are required');
+              break;
+            }
+            result = await findAndReplace(args.search_path, args.search_text, args.replace_text, args.file_pattern || '*', args.recursive !== false, logger);
+            logAndAddResult(toolName, args, result, tool.id);
+            break;
+
+          case 'ripgrep_search':
+            if (!args?.pattern) {
+              logAndAddResult(toolName, args, null, tool.id, 'pattern is required');
+              break;
+            }
+            result = await ripgrepSearch(args.pattern, args.search_path || '.', args.options || {}, logger);
+            logAndAddResult(toolName, args, result, tool.id);
+            break;
+
+          case 'todo_read':
+            result = await todoRead(logger);
+            logAndAddResult(toolName, args, result, tool.id);
+            break;
+
+          case 'todo_write':
+            if (!args?.todos || !Array.isArray(args.todos)) {
+              logAndAddResult(toolName, args, null, tool.id, 'todos array is required');
+              break;
+            }
+            result = await todoWrite(args.todos, logger);
+            logAndAddResult(toolName, args, result, tool.id);
+            break;
+
+          case 'browser_navigate':
+            if (!args?.url) {
+              logAndAddResult(toolName, args, null, tool.id, 'url is required');
+              break;
+            }
+            result = await browserNavigate(args.url, args.waitFor, args.screenshot, args.extractData || {}, logger);
+            logAndAddResult(toolName, args, result, tool.id);
+            break;
+
+          case 'browser_interact':
+            if (!args?.actions || !Array.isArray(args.actions)) {
+              logAndAddResult(toolName, args, null, tool.id, 'actions array is required');
+              break;
+            }
+            result = await browserInteract(args.actions, logger);
+            logAndAddResult(toolName, args, result, tool.id);
+            break;
+
+          case 'http_fetch':
+            if (!args?.url) {
+              logAndAddResult(toolName, args, null, tool.id, 'url is required');
+              break;
+            }
+            result = await httpFetch(args.url, args.method, args.headers, args.data, logger);
+            logAndAddResult(toolName, args, result, tool.id);
+            break;
+            
+          default:
+            logAndAddResult(toolName, args, null, tool.id, `Unknown tool: ${toolName}`);
+        }
+      } catch (error) {
+        logger.error('Tool execution error', { toolId: tool.id, error: error.message });
+        logAndAddResult(toolName, args, null, tool.id, error.message);
+      }
     }
   }
   
@@ -1565,19 +1977,68 @@ class StreamingJSONParser {
     // Look for complete field patterns like "field": "value" or "field": {...}
     const remainingBuffer = this.buffer.substring(0, currentIndex + 1);
     
-    // Match patterns like "thoughts": "some text here",
-    const stringFieldRegex = /"([^"]+)":\s*"([^"\\\\]*(\\\\.[^"\\\\]*)*)"/g;
-    let match = stringFieldRegex.exec(remainingBuffer);
+    // Find field pattern: "fieldname": "value"
+    const fieldStartRegex = /"([^"]+)":\s*"/g;
+    let fieldMatch = fieldStartRegex.exec(remainingBuffer);
     
-    if (match && !this.completedFields[match[1]]) {
-      this.completedFields[match[1]] = match[2];
-      return {
-        name: match[1],
-        value: match[2],
-        endIndex: match.index + match[0].length
-      };
+    if (fieldMatch && !this.completedFields[fieldMatch[1]]) {
+      const fieldName = fieldMatch[1];
+      const valueStartIndex = fieldMatch.index + fieldMatch[0].length;
+      
+      // Extract string value by counting escapes properly
+      const extractedValue = this.extractStringValue(remainingBuffer, valueStartIndex);
+      
+      if (extractedValue !== null) {
+        this.completedFields[fieldName] = extractedValue.value;
+        return {
+          name: fieldName,
+          value: extractedValue.value,
+          endIndex: extractedValue.endIndex
+        };
+      }
     }
     
+    return null;
+  }
+  
+  /**
+   * Extract a JSON string value by properly counting escape sequences
+   * @param {string} buffer - Buffer containing the JSON
+   * @param {number} startIndex - Index where the string value starts (after opening quote)
+   * @returns {Object|null} Extracted value and end index, or null if incomplete
+   */
+  extractStringValue(buffer, startIndex) {
+    let i = startIndex;
+    let value = '';
+    let escapeCount = 0;
+    
+    while (i < buffer.length) {
+      const char = buffer[i];
+      
+      if (char === '\\') {
+        escapeCount++;
+        value += char;
+      } else if (char === '"') {
+        // Check if this quote is escaped (odd number of preceding backslashes)
+        if (escapeCount % 2 === 0) {
+          // Unescaped quote - end of string
+          return {
+            value: value,
+            endIndex: i + 1 // Include the closing quote
+          };
+        }
+        // Escaped quote - continue
+        value += char;
+        escapeCount = 0;
+      } else {
+        value += char;
+        escapeCount = 0;
+      }
+      
+      i++;
+    }
+    
+    // Incomplete string (no closing quote found)
     return null;
   }
   
@@ -1593,15 +2054,26 @@ class StreamingJSONParser {
   }
   
   getPartialContent() {
-    // Extract partial content from buffer for real-time display
-    const thoughtsMatch = this.buffer.match(/"thoughts":\s*"([^"\\\\]*(\\\\.[^"\\\\]*)*)"/);
-    if (thoughtsMatch) {
-      return { type: 'thoughts', content: thoughtsMatch[1] };
+    // Extract partial content from buffer for real-time display using proper escape counting
+    
+    // Try to extract thoughts field
+    const thoughtsFieldMatch = this.buffer.match(/"thoughts":\s*"/);
+    if (thoughtsFieldMatch) {
+      const valueStartIndex = thoughtsFieldMatch.index + thoughtsFieldMatch[0].length;
+      const thoughtsValue = this.extractStringValue(this.buffer, valueStartIndex);
+      if (thoughtsValue) {
+        return { type: 'thoughts', content: thoughtsValue.value };
+      }
     }
     
-    const contentMatch = this.buffer.match(/"content":\s*"([^"\\\\]*(\\\\.[^"\\\\]*)*)"/);
-    if (contentMatch) {
-      return { type: 'content', content: contentMatch[1] };
+    // Try to extract content field
+    const contentFieldMatch = this.buffer.match(/"content":\s*"/);
+    if (contentFieldMatch) {
+      const valueStartIndex = contentFieldMatch.index + contentFieldMatch[0].length;
+      const contentValue = this.extractStringValue(this.buffer, valueStartIndex);
+      if (contentValue) {
+        return { type: 'content', content: contentValue.value };
+      }
     }
     
     return null;
@@ -2074,5 +2546,8 @@ export {
   ripgrepSearch,
   todoRead,
   todoWrite,
-  getToolLogMessage
+  getToolLogMessage,
+  browserNavigate,
+  browserInteract,
+  httpFetch
 };

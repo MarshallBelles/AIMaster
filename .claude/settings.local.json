@@ -1,7 +1,14 @@
 {
   "permissions": {
     "allow": [
-      "Bash(grep:*)"
+      "Bash(grep:*)",
+      "Bash(node agent.mjs \"Search for function definitions in the src directory, then create a report showing how many functions were found and in which files\")",
+      "Bash(node:*)",
+      "Bash(npx vitest:*)",
+      "Bash(rm:*)",
+      "Bash(mkdir:*)",
+      "Bash(find:*)",
+      "Bash(npm run setup:output:*)"
     ],
     "deny": []
   }

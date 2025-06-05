@@ -1,0 +1,2 @@
+# Keep output directory in git but ignore contents
+# All test artifacts and automation outputs go here

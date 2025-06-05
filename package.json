@@ -6,7 +6,15 @@
   "main": "agent.mjs",
   "scripts": {
     "start": "node agent.mjs",
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "test": "vitest",
+    "test:ui": "vitest --ui",
+    "test:run": "vitest run",
+    "test:watch": "vitest --watch",
+    "test:coverage": "vitest run --coverage",
+    "clean": "rm -rf output/tests/* output/temp/* output/logs/* output/artifacts/*",
+    "clean:all": "rm -rf output/*",
+    "clean:reports": "rm -rf output/reports/*",
+    "setup:output": "mkdir -p output/{tests,logs,reports,temp,artifacts}"
   },
   "keywords": [
     "ai",
@@ -22,6 +30,12 @@
     "chalk": "^5.4.1",
     "commander": "^14.0.0",
     "inquirer": "^12.6.3",
-    "ora": "^8.2.0"
+    "nunjucks": "^3.2.4",
+    "ora": "^8.2.0",
+    "playwright": "^1.40.0"
+  },
+  "devDependencies": {
+    "@vitest/ui": "^3.2.1",
+    "vitest": "^3.2.1"
   }
 }
