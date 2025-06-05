@@ -50,3 +50,5 @@ coverage/
 
 # Todo file (persistent across sessions)
 .aim-todos.json
+
+node_modules/
