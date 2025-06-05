@@ -1,0 +1,31 @@
+{
+  "agents": {
+    "personalAssistant": {
+      "name": "Personal Assistant",
+      "apiUrl": "http://localhost:11434",
+      "model": "llama3.2",
+      "temperature": 0.7,
+      "maxTokens": 2048,
+      "enabled": true
+    },
+    "coder": {
+      "name": "Coder Agent",
+      "apiUrl": "http://Arbiter2:8080",
+      "model": "qwen-2-5-coder",
+      "temperature": 0.1,
+      "maxTokens": 4096,
+      "enabled": true
+    }
+  },
+  "server": {
+    "port": 3000,
+    "host": "localhost"
+  },
+  "logging": {
+    "level": "info",
+    "format": "pretty"
+  },
+  "telemetry": {
+    "enabled": false
+  }
+}

@@ -8,7 +8,18 @@
       "Bash(rm:*)",
       "Bash(mkdir:*)",
       "Bash(find:*)",
-      "Bash(npm run setup:output:*)"
+      "Bash(npm run setup:output:*)",
+      "Bash(cp:*)",
+      "mcp__mastra__mastraDocs",
+      "Bash(npm run:*)",
+      "Bash(claude mcp add:*)",
+      "mcp__enhanced-coder__gitStatus",
+      "mcp__enhanced-coder__executeShellEnhanced",
+      "mcp__enhanced-coder__readFileEnhanced",
+      "Bash(rg:*)",
+      "Bash(ls:*)",
+      "mcp__enhanced-coder__findCodeOrFunction",
+      "mcp__enhanced-coder__getSessionSummary"
     ],
     "deny": []
   }
